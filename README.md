@@ -90,7 +90,41 @@ Both scripts take the ansible root path as the first argument.
 - **v1 mode:** the script reads `[defaults] vault_password_file` from `<ansible_root>/ansible.cfg`. If that file exists, its contents are the password. If it does not exist, the script prompts on stdin and *writes the entered password to that path* — so the next run is non-interactive. (Inherited behavior; unchanged.)
 - **v2 mode:** each group's `vault_password_file` is treated as an absolute or `~`-relative path. The script reads it directly; if missing, the group is skipped (no prompt).
 
+## Migration helpers
+
+Three companion scripts assist the v1 → v2 migration:
+
+```bash
+# Print a v2 vault_groups stub derived from playbooks/<env>/ subdirs and matching host_vars.
+python encryptor/encryptor_init.py ansible
+
+# Verify v2 coverage: duplicate vault_ids/files, overlapping paths, YAML files outside any
+# vault_groups paths that still contain plaintext (error) or !vault (warning) secrets.
+python encryptor/encryptor_check.py ansible
+
+# Rotate every !vault block in each group's paths under that group's current vault_id.
+# Decrypts using any available vault password (ansible.cfg legacy + every group's file),
+# re-encrypts under the group's vault. Idempotent: blocks already labeled with the
+# group's vault_id are skipped.
+python encryptor/encryptor_rotate.py ansible
+
+# Pass an explicit source vault when rotating to a fresh password file. Repeatable.
+# Use this when the previous vault file is not (or no longer) referenced from ansible.cfg
+# or any vault_groups entry, e.g. when rotating <env>'s password to a new file.
+python encryptor/encryptor_rotate.py ansible --from-vault ~/.ansible/<repo>-<env>-old.vault
+```
+
+Typical migration flow for an environment moving off the shared legacy vault:
+
+1. Generate the new password file: `head -c 32 /dev/urandom | base64 > ~/.ansible/<repo>-<env>.vault`.
+2. Edit `encryptor.yml`: point that group's `vault_password_file` at the new path.
+3. Run `encryptor_rotate.py`. It decrypts the legacy blocks via `ansible.cfg`'s `vault_password_file`, re-encrypts them under the new group vault, and rewrites the YAML files in place.
+4. Run `encryptor_check.py` to confirm coverage.
+5. Once every environment has its own vault file, the legacy `vault_password_file` in `ansible.cfg` can be removed or repointed.
+
+To rotate an already-v2 group's password to a fresh file (e.g. compromise response, key hygiene): generate the new file, point the group's `vault_password_file` at it, then run `encryptor_rotate.py --from-vault <path-to-old-file>`. Delete the old file once the rotation completes successfully.
+
 ## Limitations
 
 - Variable detection is regex-based on line prefix `^<NAME>: `; values must be a single line (multi-line YAML scalars at the top of a key are not supported as input — but the resulting `!vault | …` block, which is multi-line, is correctly preserved on subsequent runs).
-- The encryptor does not implement re-keying. To rotate a vault, decrypt-then-re-encrypt manually, or use `ansible-vault rekey` directly on the YAML files.
+- `encryptor_rotate.py` requires v2 mode (`vault_groups` declared). For pure v1 repos, use `ansible-vault rekey` directly on the YAML files.
