@@ -92,6 +92,5 @@ Both scripts take the ansible root path as the first argument.
 
 ## Limitations
 
-- Only `.yml` files are scanned (not `.yaml`).
 - Variable detection is regex-based on line prefix `^<NAME>: `; values must be a single line (multi-line YAML scalars at the top of a key are not supported as input — but the resulting `!vault | …` block, which is multi-line, is correctly preserved on subsequent runs).
 - The encryptor does not implement re-keying. To rotate a vault, decrypt-then-re-encrypt manually, or use `ansible-vault rekey` directly on the YAML files.

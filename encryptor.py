@@ -15,6 +15,9 @@ except ImportError:
     import configparser
 
 
+YAML_EXTENSIONS = ('.yml', '.yaml')
+
+
 def load_config(prefix):
     config = {
         'explicit_start': True,
@@ -52,7 +55,7 @@ def get_variables_files(prefix):
     for directory in get_variables_folders():
         for root, dirs, files in os.walk(os.path.join(prefix, directory)):
             for inner_file in files:
-                if inner_file.endswith(".yml"):  # todo: support multiple extensions?
+                if inner_file.endswith(YAML_EXTENSIONS):
                     yield os.path.join(root, inner_file)
 
 
@@ -154,7 +157,7 @@ class ExplicitVaultSecret(VaultSecret):
 
 
 def get_files_in_paths(prefix, paths):
-    """Yield .yml files under each entry of `paths` (relative to `prefix`).
+    """Yield YAML files under each entry of `paths` (relative to `prefix`).
 
     Each entry may be a file or a directory. Missing entries are silently skipped
     so callers can declare forward-looking paths (e.g. host_vars files not yet created).
@@ -163,13 +166,13 @@ def get_files_in_paths(prefix, paths):
     for rel_path in paths:
         abs_path = os.path.join(prefix, rel_path)
         if os.path.isfile(abs_path):
-            if abs_path.endswith('.yml') and abs_path not in seen:
+            if abs_path.endswith(YAML_EXTENSIONS) and abs_path not in seen:
                 seen.add(abs_path)
                 yield abs_path
         elif os.path.isdir(abs_path):
             for root, dirs, files in os.walk(abs_path):
                 for inner_file in files:
-                    if inner_file.endswith('.yml'):
+                    if inner_file.endswith(YAML_EXTENSIONS):
                         f = os.path.join(root, inner_file)
                         if f not in seen:
                             seen.add(f)
