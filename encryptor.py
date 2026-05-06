@@ -17,6 +17,10 @@ except ImportError:
 
 YAML_EXTENSIONS = ('.yml', '.yaml')
 
+# Matches a YAML block scalar header like `|`, `>`, `|-`, `|+`, `>2`, optionally
+# followed by an inline comment. Captured after the `KEY: ` prefix.
+BLOCK_SCALAR_HEADER_RE = re.compile(r'^[|>][-+]?\d*\s*(#.*)?$')
+
 
 def load_config(prefix):
     config = {
@@ -179,6 +183,32 @@ def get_files_in_paths(prefix, paths):
                             yield f
 
 
+def _extract_scalar_value(variable_lines, variables_regexp):
+    """Reconstruct a YAML scalar value from a key block's lines.
+
+    Handles two cases:
+    - Inline scalar (`KEY: value` on a single line): returns `value`.
+    - Block literal (`KEY: |` followed by indented continuation lines): returns the
+      joined continuation lines with their common leading indent stripped, with a
+      single trailing newline (default `|` chomp). Folded `>` is treated as `|` —
+      acceptable lossy semantics for secrets, which never need fold-to-spaces.
+    """
+    inline = re.match(variables_regexp, variable_lines[0]).group(2).rstrip('\r\n').rstrip()
+    if not BLOCK_SCALAR_HEADER_RE.match(inline):
+        return inline
+
+    continuation = variable_lines[1:]
+    nonblank = [l for l in continuation if l.strip()]
+    if not nonblank:
+        return ''
+    block_indent = len(nonblank[0]) - len(nonblank[0].lstrip())
+    stripped = [
+        line[block_indent:] if len(line) > block_indent else '\n'
+        for line in continuation
+    ]
+    return ''.join(stripped).rstrip('\n') + '\n'
+
+
 def encrypt_files(vault, encrypted_variables, files_iter, vault_id=None):
     variables_regexp = r'^(?P<name>{}): (?P<data>.*)'.format('|'.join(encrypted_variables))
 
@@ -214,8 +244,8 @@ def encrypt_files(vault, encrypted_variables, files_iter, vault_id=None):
 
                 lines.insert(i, '{}: !vault |\n'.format(variable_name))
 
-                variable_data = re.match(variables_regexp, ''.join(variable_lines)).group(2)
-                encrypted_data = vault.encrypt(''.join(variable_data), **encrypt_kwargs)
+                variable_data = _extract_scalar_value(variable_lines, variables_regexp)
+                encrypted_data = vault.encrypt(variable_data, **encrypt_kwargs)
                 for j, encrypted_line in enumerate(encrypted_data.splitlines(True)):
                     lines.insert(i+j+1, ' '*6 + encrypted_line.decode())
 
