@@ -138,23 +138,53 @@ class VaultSecret(Secret):
             self._write_vault(self.key)
 
 
-def main(prefix):
-    # load list of protected variables
-    config = load_config(prefix)
+class ExplicitVaultSecret(VaultSecret):
+    """Vault secret bound to an explicit file path (bypasses ansible.cfg lookup).
 
-    encrypted_variables = config.get('encrypted_variables')
-    assert encrypted_variables, 'No variables to encrypt'
+    Used by the per-environment vault_groups mode so each group can specify its own
+    password file independent of ansible.cfg's vault_password_file.
+    """
 
-    vault = VaultLib(secrets=[['default', VaultSecret(prefix)]])
+    def __init__(self, vault_path):
+        Secret.__init__(self)
+        self.vault_path = vault_path
 
+    def _get_vault_location(self):
+        return self.vault_path
+
+
+def get_files_in_paths(prefix, paths):
+    """Yield .yml files under each entry of `paths` (relative to `prefix`).
+
+    Each entry may be a file or a directory. Missing entries are silently skipped
+    so callers can declare forward-looking paths (e.g. host_vars files not yet created).
+    """
+    seen = set()
+    for rel_path in paths:
+        abs_path = os.path.join(prefix, rel_path)
+        if os.path.isfile(abs_path):
+            if abs_path.endswith('.yml') and abs_path not in seen:
+                seen.add(abs_path)
+                yield abs_path
+        elif os.path.isdir(abs_path):
+            for root, dirs, files in os.walk(abs_path):
+                for inner_file in files:
+                    if inner_file.endswith('.yml'):
+                        f = os.path.join(root, inner_file)
+                        if f not in seen:
+                            seen.add(f)
+                            yield f
+
+
+def encrypt_files(vault, encrypted_variables, files_iter, vault_id=None):
     variables_regexp = r'^(?P<name>{}): (?P<data>.*)'.format('|'.join(encrypted_variables))
 
-    # for every file having variables
-    for var_file in get_variables_files(prefix):
+    encrypt_kwargs = {'vault_id': vault_id} if vault_id else {}
+
+    for var_file in files_iter:
         updated = False
 
         with open(var_file, 'r') as stream:
-            # load file
             lines = stream.readlines()
             assert lines, 'empty file: {}'.format(var_file)
 
@@ -182,7 +212,7 @@ def main(prefix):
                 lines.insert(i, '{}: !vault |\n'.format(variable_name))
 
                 variable_data = re.match(variables_regexp, ''.join(variable_lines)).group(2)
-                encrypted_data = vault.encrypt(''.join(variable_data))
+                encrypted_data = vault.encrypt(''.join(variable_data), **encrypt_kwargs)
                 for j, encrypted_line in enumerate(encrypted_data.splitlines(True)):
                     lines.insert(i+j+1, ' '*6 + encrypted_line.decode())
 
@@ -194,6 +224,37 @@ def main(prefix):
 
         with open(var_file, 'w') as stream:
             stream.writelines(lines)
+
+
+def main(prefix):
+    # load list of protected variables
+    config = load_config(prefix)
+
+    encrypted_variables = config.get('encrypted_variables')
+    assert encrypted_variables, 'No variables to encrypt'
+
+    vault_groups = config.get('vault_groups')
+    if vault_groups:
+        # per-environment mode: one vault per group, walk only the group's paths
+        for group in vault_groups:
+            vault_id = group['vault_id']
+            vault_path = os.path.expanduser(group['vault_password_file'])
+            paths = group.get('paths') or []
+
+            if not os.path.exists(vault_path):
+                sys.stderr.write(
+                    "encryptor: vault file for group '{}' not found at {} -- "
+                    "skipping (no access to {} secrets)\n".format(vault_id, vault_path, vault_id)
+                )
+                continue
+
+            print("encryptor: group '{}' ({}) over {}".format(vault_id, vault_path, paths))
+            vault = VaultLib(secrets=[[vault_id, ExplicitVaultSecret(vault_path)]])
+            encrypt_files(vault, encrypted_variables, get_files_in_paths(prefix, paths), vault_id=vault_id)
+    else:
+        # legacy mode: single vault from ansible.cfg, walk default variable folders
+        vault = VaultLib(secrets=[['default', VaultSecret(prefix)]])
+        encrypt_files(vault, encrypted_variables, get_variables_files(prefix))
 
 
 if __name__ == '__main__':

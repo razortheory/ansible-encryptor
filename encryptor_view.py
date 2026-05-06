@@ -7,7 +7,37 @@ import sys
 
 from ansible.parsing.vault import VaultLib
 
-from encryptor import load_config, get_variable_lines, VaultSecret
+from encryptor import load_config, get_variable_lines, VaultSecret, ExplicitVaultSecret
+
+
+def _build_secrets(prefix, config):
+    """Aggregate all available vault secrets so VaultLib can decrypt blobs from any group.
+
+    In vault_groups mode we register one secret per group whose vault file exists;
+    VaultLib will try each in turn. Missing files are skipped (the user may not have
+    access to all environments). In legacy mode we fall back to ansible.cfg's
+    vault_password_file, preserving the original behavior for repos that haven't
+    migrated to vault_groups.
+    """
+    vault_groups = config.get('vault_groups')
+    if vault_groups:
+        secrets = []
+        for group in vault_groups:
+            vault_path = os.path.expanduser(group['vault_password_file'])
+            if os.path.exists(vault_path):
+                secrets.append([group['vault_id'], ExplicitVaultSecret(vault_path)])
+            else:
+                sys.stderr.write(
+                    "encryptor_view: vault file for group '{}' not found at {} -- skipping\n".format(
+                        group['vault_id'], vault_path
+                    )
+                )
+        if secrets:
+            return secrets
+        sys.stderr.write(
+            "encryptor_view: no vault_groups files available; falling back to ansible.cfg vault_password_file\n"
+        )
+    return [['default', VaultSecret(prefix)]]
 
 
 def main(prefix, file_path):
@@ -17,7 +47,7 @@ def main(prefix, file_path):
     encrypted_variables = config.get('encrypted_variables')
     assert encrypted_variables, 'No variables to encrypt'
 
-    vault = VaultLib(secrets=[['default', VaultSecret(prefix)]])
+    vault = VaultLib(secrets=_build_secrets(prefix, config))
 
     encrypted_variable_regexp = r'^(?P<name>\w+): !vault \|'
 
