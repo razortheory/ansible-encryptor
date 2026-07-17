@@ -1,40 +1,116 @@
 # ansible-encryptor
 
-In-place vault encryption / decryption for variables in Ansible inventory and playbook YAML files.
+Developer-side tooling for encrypting selected Ansible YAML variables in place with
+[Ansible Vault](https://docs.ansible.com/ansible/latest/vault_guide/index.html).
 
-Reads a list of "secret variable names" from `encryptor.yml`, walks variable directories (`group_vars/`, `host_vars/`, `inventories/`, `playbooks/`, etc.), finds plaintext values for those variables, and rewrites them as `!vault | …` blocks encrypted with Ansible's vault format. The matching `encryptor_view.py` decrypts a single file back to plaintext for inspection.
+The encrypted value stays beside the rest of its configuration as a native `!vault` block, so
+`ansible-playbook` can consume the file without a custom runtime plugin. The tool supports both a
+single legacy vault and separate vault IDs for independently managed environments.
 
-The point: keep secrets *next to* the rest of the variable definitions instead of in a separate per-secret vault file, while still using Ansible's standard vault on disk. `ansible-playbook` reads the resulting `!vault` blocks natively — the encryptor is purely a developer-side authoring tool.
+## What it provides
+
+- In-place encryption of configured variable names in `.yml` and `.yaml` files.
+- Idempotent handling of values that are already encrypted.
+- A read-only command that decrypts one file to standard output.
+- Per-environment vault IDs, password files, and owned path sets.
+- Helpers for discovering a v2 configuration, checking path coverage, and rotating vault blocks.
+
+```mermaid
+flowchart LR
+    Config["encryptor.yml<br/>variables and path ownership"] --> Encryptor["encryptor.py"]
+    Plain["Ansible YAML<br/>temporary plaintext value"] --> Encryptor
+    Key["Vault password file<br/>outside Git"] --> Encryptor
+    Encryptor --> Encrypted["Same YAML file<br/>!vault block"]
+    Encrypted --> Ansible["ansible-playbook"]
+    Key --> Ansible
+    Encrypted --> View["encryptor_view.py"]
+    Key --> View
+    View --> Stdout["Plaintext on stdout"]
+```
+
+## Security model
+
+This tool protects secrets committed to Git; it is not a secret store or an authorization system.
+Anyone with both the encrypted file and its vault password can decrypt the value.
+
+- Keep vault password files outside the repository and restrict their permissions, for example
+  with `chmod 600`.
+- Never commit the temporary plaintext value. Run the encryptor before staging and inspect the diff.
+- `encryptor_view.py` writes decrypted content to stdout. Do not run it in CI or a captured terminal
+  unless exposing that output is acceptable.
+- In legacy v1 mode, a missing password file triggers an interactive prompt and the entered password
+  is written to the path from `ansible.cfg`. Pre-create that file with restrictive permissions.
+- Run the tooling only against trusted repository content. It is an authoring helper, not a sandbox
+  for untrusted YAML or configuration.
 
 ## Requirements
 
-- Python 3
-- `ansible` installed (uses `ansible.parsing.vault.VaultLib`)
-- `pyyaml`
+- A maintained Python 3 runtime. Razortheory consumers should use Python 3.9 or newer.
+- Ansible, which provides `ansible.parsing.vault.VaultLib`.
+- PyYAML.
 
-`requirements.txt` covers these.
+Install the Python dependencies in an isolated environment:
 
-## Configuration — `encryptor.yml`
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
-The config lives at `<ansible_root>/encryptor.yml`. It must declare which variables to encrypt; it may also (v2 schema, see below) declare per-environment vault groups.
+`requirements.txt` intentionally does not pin an Ansible release. The selected release determines
+the exact controller-Python requirements; consuming repositories should pin and test that combination.
 
-### v1 schema — single vault for the whole repo
+## Repository integration
+
+A typical consumer includes this project as an `encryptor/` submodule next to its `ansible/`
+directory:
+
+```text
+consumer-repository/
+├── ansible/
+│   ├── ansible.cfg
+│   └── encryptor.yml
+└── encryptor/
+```
+
+For example:
+
+```bash
+git submodule add git@github.com:razortheory/ansible-encryptor.git encryptor
+git submodule update --init
+```
+
+The scripts accept the Ansible root as their first positional argument. Examples below assume the
+layout above and are run from the consumer-repository root.
+
+## Configuration
+
+Create `ansible/encryptor.yml` and list every variable that must be encrypted.
+
+### v1: one vault for the repository
 
 ```yaml
+---
 encrypted_variables:
   - SECRET_KEY
   - DATABASE_URL
-  - NEWRELIC_LICENCE_KEY
   - SENTRY_DSN
 ```
 
-In v1 mode the encryptor walks **all** variable folders under `<ansible_root>/` (`env_vars/`, `group_vars/`, `host_vars/`, `inventories/`, `playbooks/`, `roles/common/vars/`, `roles/ansible-variables/vars/`) and encrypts every plaintext occurrence of a listed variable using the single vault file pointed to by `vault_password_file` in `<ansible_root>/ansible.cfg`. Output blocks are produced in legacy format `$ANSIBLE_VAULT;1.1;AES256` (no vault-id label). This matches the original behavior of the script and is what every existing repo using this submodule sees.
+In v1 mode, the encryptor:
 
-### v2 schema — per-environment vault groups
+1. Reads `[defaults] vault_password_file` from `ansible/ansible.cfg`.
+2. Walks the conventional variable locations listed below.
+3. Writes unlabeled `$ANSIBLE_VAULT;1.1;AES256` blocks.
 
-When secrets for different environments need different vault keys (e.g. testnet developers should not have prod-vault access), declare `vault_groups` in `encryptor.yml`:
+The scanned locations are `env_vars/`, `group_vars/`, `host_vars/`, `inventories/`, `playbooks/`,
+`roles/common/vars/`, and `roles/ansible-variables/vars/`, all relative to the Ansible root.
+
+### v2: separate vaults by environment
 
 ```yaml
+---
 vault_groups:
   - vault_id: prod
     vault_password_file: ~/.ansible/myproject-prod.vault
@@ -54,77 +130,119 @@ encrypted_variables:
   - DISTRIBUTOR_SIGNER
 ```
 
-Behavior in v2 mode:
-- Each group is processed independently. The encryptor walks **only** the paths listed for that group and encrypts with **that group's** vault password file. The resulting `!vault` blocks carry an explicit vault-id label (`$ANSIBLE_VAULT;1.2;AES256;<vault_id>`).
-- A group whose `vault_password_file` does not exist on disk is skipped with a warning. This is the access-control mechanism: a developer who only has `~/.ansible/myproject-testnet.vault` runs the encryptor and modifies only testnet secrets; prod secrets are not touched.
-- Files outside every declared `paths` set are not visited. This is intentional — shared `inventories/group_vars/all/` files typically don't contain secrets and stay untouched.
-- The decryptor (`encryptor_view.py`) aggregates **all available** vault files into a single `VaultLib`, so it can read blobs whose vault-id is present locally; missing vault files are skipped with a warning, and blocks they would have decrypted will fail with the standard Ansible error.
+Each group owns only its declared files and directories. Existing files are scanned recursively;
+missing paths are ignored so a configuration may include forward-looking entries. A missing vault
+password file skips that group with a warning. Encrypted output uses labeled
+`$ANSIBLE_VAULT;1.2;AES256;<vault_id>` blocks.
 
-The two schemas are mutually exclusive in a given config: if `vault_groups` is set, the encryptor uses v2 mode; if it's absent, v1 mode (legacy behavior). All other repos using the submodule continue to work unchanged.
+The schemas are mutually exclusive at runtime: the presence of `vault_groups` selects v2 mode;
+otherwise the tool uses legacy v1 behavior.
 
-## Usage
+## Command reference
 
-Run from the repo that hosts both `<ansible_root>/encryptor.yml` and the submodule:
+| Command | Purpose | Writes files |
+|---|---|---:|
+| `python encryptor/encryptor.py ansible` | Encrypt configured plaintext variables | Yes |
+| `python encryptor/encryptor_view.py ansible <relative-yaml-path>` | Render one file with available vault blocks decrypted | No; prints plaintext |
+| `python encryptor/encryptor_init.py ansible` | Generate a proposed v2 configuration on stdout | No |
+| `python encryptor/encryptor_check.py ansible` | Validate v2 declarations, overlaps, and secret coverage | No |
+| `python encryptor/encryptor_rotate.py ansible` | Re-encrypt v2 blocks under their owning vault IDs | Yes |
+| `python encryptor/encryptor_rotate.py ansible --from-vault <path>` | Add a source password while rotating; repeatable | Yes |
 
-```bash
-# Encrypt: rewrite plaintext occurrences of every listed variable as !vault blocks.
-# Idempotent — already-encrypted blocks are skipped with a "skipping" message.
-python encryptor/encryptor.py ansible
+### Encrypt a new variable
 
-# Decrypt a single file to stdout (does not modify the file on disk).
-python encryptor/encryptor_view.py ansible playbooks/testnet/group_vars/all/django_variables.yml
-```
+1. Add its exact name to `encrypted_variables`.
+2. Add the temporary plaintext value to a supported YAML file.
+3. Run `python encryptor/encryptor.py ansible`.
+4. Verify that the value became a `!vault` block and inspect `git diff`.
+5. Commit only the encrypted result.
 
-Both scripts take the ansible root path as the first argument.
+Already encrypted blocks are skipped, so repeated runs are safe for unchanged content.
 
-## Adding a new secret variable
+### View an encrypted file
 
-1. Add the variable name to `encrypted_variables` in `encryptor.yml`.
-2. Edit the YAML file where the secret should live. Write it as a plain key/value:
-   `SOME_KEY: my-secret-value`.
-3. Run `python encryptor/encryptor.py ansible`. The script will replace the plain value with a `!vault | …` block in place.
-4. Commit the resulting file.
-
-## Vault file lookup
-
-- **v1 mode:** the script reads `[defaults] vault_password_file` from `<ansible_root>/ansible.cfg`. If that file exists, its contents are the password. If it does not exist, the script prompts on stdin and *writes the entered password to that path* — so the next run is non-interactive. (Inherited behavior; unchanged.)
-- **v2 mode:** each group's `vault_password_file` is treated as an absolute or `~`-relative path. The script reads it directly; if missing, the group is skipped (no prompt).
-
-## Migration helpers
-
-Three companion scripts assist the v1 → v2 migration:
+The file path is relative to the Ansible root:
 
 ```bash
-# Print a v2 vault_groups stub derived from playbooks/<env>/ subdirs and matching host_vars.
-python encryptor/encryptor_init.py ansible
-
-# Verify v2 coverage: duplicate vault_ids/files, overlapping paths, YAML files outside any
-# vault_groups paths that still contain plaintext (error) or !vault (warning) secrets.
-python encryptor/encryptor_check.py ansible
-
-# Rotate every !vault block in each group's paths under that group's current vault_id.
-# Decrypts using any available vault password (ansible.cfg legacy + every group's file),
-# re-encrypts under the group's vault. Idempotent: blocks already labeled with the
-# group's vault_id are skipped.
-python encryptor/encryptor_rotate.py ansible
-
-# Pass an explicit source vault when rotating to a fresh password file. Repeatable.
-# Use this when the previous vault file is not (or no longer) referenced from ansible.cfg
-# or any vault_groups entry, e.g. when rotating <env>'s password to a new file.
-python encryptor/encryptor_rotate.py ansible --from-vault ~/.ansible/<repo>-<env>-old.vault
+python encryptor/encryptor_view.py \
+  ansible \
+  playbooks/testnet/group_vars/all/django_variables.yml
 ```
 
-Typical migration flow for an environment moving off the shared legacy vault:
+In v2 mode the command loads every locally available group password. Missing password files are
+reported and skipped. If no group passwords are available, it falls back to the legacy
+`vault_password_file` from `ansible.cfg`.
 
-1. Generate the new password file: `head -c 32 /dev/urandom | base64 > ~/.ansible/<repo>-<env>.vault`.
-2. Edit `encryptor.yml`: point that group's `vault_password_file` at the new path.
-3. Run `encryptor_rotate.py`. It decrypts the legacy blocks via `ansible.cfg`'s `vault_password_file`, re-encrypts them under the new group vault, and rewrites the YAML files in place.
-4. Run `encryptor_check.py` to confirm coverage.
-5. Once every environment has its own vault file, the legacy `vault_password_file` in `ansible.cfg` can be removed or repointed.
+## Migrating from v1 to v2
 
-To rotate an already-v2 group's password to a fresh file (e.g. compromise response, key hygiene): generate the new file, point the group's `vault_password_file` at it, then run `encryptor_rotate.py --from-vault <path-to-old-file>`. Delete the old file once the rotation completes successfully.
+1. Generate a starting configuration and review it; the command does not modify `encryptor.yml`:
 
-## Limitations
+   ```bash
+   python encryptor/encryptor_init.py ansible > /tmp/encryptor-v2.yml
+   ```
 
-- Variable detection is regex-based on line prefix `^<NAME>: `; values must be a single line (multi-line YAML scalars at the top of a key are not supported as input — but the resulting `!vault | …` block, which is multi-line, is correctly preserved on subsequent runs).
-- `encryptor_rotate.py` requires v2 mode (`vault_groups` declared). For pure v1 repos, use `ansible-vault rekey` directly on the YAML files.
+2. Copy the reviewed `vault_groups` into `ansible/encryptor.yml` and create each password file:
+
+   ```bash
+   umask 077
+   head -c 32 /dev/urandom | base64 > ~/.ansible/myproject-testnet.vault
+   ```
+
+3. Rotate existing blocks. The legacy password from `ansible.cfg` is included in the decryption
+   pool when its file exists:
+
+   ```bash
+   python encryptor/encryptor_rotate.py ansible
+   ```
+
+4. Check ownership and coverage, then inspect the rewritten YAML:
+
+   ```bash
+   python encryptor/encryptor_check.py ansible
+   git diff --check
+   git diff -- ansible
+   ```
+
+To rotate a group's password, point the group at the new password file and provide the old file as a
+source:
+
+```bash
+python encryptor/encryptor_rotate.py \
+  ansible \
+  --from-vault ~/.ansible/myproject-testnet-old.vault
+```
+
+Delete the old password only after the rotation and validation succeed.
+
+## Parsing and behavior limitations
+
+- Variable matching is regex-based and expects an unindented `NAME: value` line.
+- Input values may be inline scalars or block scalars. Folded `>` input is normalized using literal
+  `|` semantics during encryption, so whitespace-sensitive secrets require review.
+- `encrypted_variables` values are interpolated into the matching regular expression and should be
+  conventional YAML variable names.
+- v2 path overlaps are ambiguous. `encryptor_check.py` reports files claimed by multiple groups as
+  errors.
+- Files outside all v2 group paths are not encrypted or rotated. The coverage checker reports
+  plaintext configured variables as errors and existing vault blocks as warnings.
+- `encryptor_rotate.py` is available only in v2 mode.
+
+## Development checks
+
+This repository currently has no automated test suite or CI workflow. Before changing the scripts,
+at minimum run a syntax check and exercise the workflow against disposable fixture files:
+
+```bash
+python3 -m py_compile \
+  encryptor.py \
+  encryptor_check.py \
+  encryptor_init.py \
+  encryptor_rotate.py \
+  encryptor_view.py
+```
+
+Never use production-only vault material as a development fixture.
+
+## License
+
+No license file is currently included in this repository.
