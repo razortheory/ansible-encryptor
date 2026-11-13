@@ -95,9 +95,15 @@ def _rotate_file(file_path, decrypt_vault, encrypt_vault, target_vault_id):
         encrypted_data = '\n'.join(l.strip() for l in block_lines[1:])
 
         if _block_vault_id(encrypted_data) == target_vault_id:
-            skipped += 1
-            i += len(block_lines)
-            continue
+            try:
+                encrypt_vault.decrypt(encrypted_data)
+            except AnsibleVaultError:
+                # A vault-id identifies the owner, not the password version.
+                pass
+            else:
+                skipped += 1
+                i += len(block_lines)
+                continue
 
         try:
             plaintext = decrypt_vault.decrypt(encrypted_data)

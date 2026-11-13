@@ -212,7 +212,11 @@ python encryptor/encryptor_rotate.py \
   --from-vault ~/.ansible/myproject-testnet-old.vault
 ```
 
-Delete the old password only after the rotation and validation succeed.
+A block with the target vault ID is skipped only when the current target password can decrypt it.
+Otherwise it is decrypted with an available source password and re-encrypted with the target password.
+Verify new-password decryption, old-password rejection, and unchanged plaintext values after rekeying.
+Keep the old password while another repository or a required historical revision depends on it.
+Rekeying current files does not revoke access to old ciphertext in Git history or backups.
 
 ## Parsing and behavior limitations
 
@@ -229,10 +233,11 @@ Delete the old password only after the rotation and validation succeed.
 
 ## Development checks
 
-This repository currently has no automated test suite or CI workflow. Before changing the scripts,
-at minimum run a syntax check and exercise the workflow against disposable fixture files:
+Run the focused rotation tests, a syntax check, and any additional workflow checks against disposable
+fixture files. This repository currently has no CI workflow.
 
 ```bash
+python3 -m unittest discover -s tests -v
 python3 -m py_compile \
   encryptor.py \
   encryptor_check.py \
